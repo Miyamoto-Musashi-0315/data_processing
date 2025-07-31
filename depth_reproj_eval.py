@@ -29,7 +29,6 @@ def load_camera_params(npz_path):
     params['K_new'] = params['P1'][:, :3]
     params['K_inv'] = np.linalg.inv(params['K_new'])
     params['T'] = np.array([params['baseline'], 0, 0])
-
     return params
 
 def compute_grad_error(I_left, eps=1e-4):
@@ -63,7 +62,15 @@ def project_to_view(X_one, P_two):
     length = X_one.shape[0]
     X_one_hom = np.hstack([X_one, np.ones((length, 1))])  # (H*W, 4)
     x_two = (P_two @ X_one_hom.T).T  # (H*W, 3)
-    return x_two[:, :2] / x_two[:, 2, None]    
+    
+    # Handle division by zero and invalid values
+    z_vals = x_two[:, 2]
+    valid_mask = np.abs(z_vals) > 1e-6  # avoid division by very small numbers
+    
+    result = np.full((x_two.shape[0], 2), np.nan)
+    result[valid_mask] = x_two[valid_mask, :2] / z_vals[valid_mask, None]
+    
+    return result
 
 
 def depth_projection_errors(D_left, x_right, K_inv, P_one, T, fx_B, error_types=['px', 'depth']):
@@ -106,28 +113,62 @@ def photometric_errors(I_L, I_R, x_right, error_types=['l1', 'l2', 'ssim']):
     I_R: HxWx3 right image
     x_right: HxWx2 of (u_R, v_R) reprojected coordinates in right image
     """
-    H, W, _ = I_L.shape
+    H_img, W_img, _ = I_L.shape
+    
+    # Handle case where x_right comes from a different resolution depth map
+    if x_right.shape[0] != H_img * W_img:
+        # Calculate actual depth map dimensions
+        total_pixels = x_right.shape[0]
+        
+        # Find the original depth map dimensions by trying common aspect ratios
+        for h_depth in range(1, int(np.sqrt(total_pixels)) + 1):
+            if total_pixels % h_depth == 0:
+                w_depth = total_pixels // h_depth
+                if abs(h_depth / w_depth - H_img / W_img) < 0.1:  # similar aspect ratio
+                    break
+        
+        # Reshape to depth map dimensions
+        x_right_reshaped = x_right.reshape(h_depth, w_depth, 2)
+        
+        # Resize to match image dimensions
+        u_R = cv2.resize(x_right_reshaped[..., 0].astype(np.float32), (W_img, H_img), interpolation=cv2.INTER_LINEAR)
+        v_R = cv2.resize(x_right_reshaped[..., 1].astype(np.float32), (W_img, H_img), interpolation=cv2.INTER_LINEAR)
+    else:
+        # Direct reshape if dimensions match
+        u_R = x_right[..., 0].astype(np.float32).reshape(H_img, W_img)
+        v_R = x_right[..., 1].astype(np.float32).reshape(H_img, W_img)
 
-    # Split u_R and v_R
-    u_R = x_right[..., 0].astype(np.float32).reshape(H, W)
-    v_R = x_right[..., 1].astype(np.float32).reshape(H, W)
-
+    # Ensure the coordinate maps are in the correct format for cv2.remap
+    u_R = u_R.astype(np.float32)
+    v_R = v_R.astype(np.float32)
+    
+    # Handle NaN values by setting them to invalid coordinates
+    nan_mask = np.isnan(u_R) | np.isnan(v_R)
+    u_R[nan_mask] = -1  # Invalid coordinates that will be ignored
+    v_R[nan_mask] = -1
+    
     valid = (
-        (u_R >= 0) & (u_R < W) &
-        (v_R >= 0) & (v_R < H)
+        (u_R >= 0) & (u_R < W_img) &
+        (v_R >= 0) & (v_R < H_img)
     )
 
     # Warp each channel using remap
-    I_R_warped = cv2.remap(I_R, u_R, v_R, interpolation=cv2.INTER_LINEAR,
+    I_R_warped = cv2.remap(I_R.astype(np.uint8), u_R, v_R, interpolation=cv2.INTER_LINEAR,
                   borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    
     errors = []
     if 'l1' in error_types:
-        errors.append(np.mean(np.abs(I_L - I_R_warped), axis=-1))  # H x W scalar map
+        l1_error = np.mean(np.abs(I_L - I_R_warped), axis=-1)
+        l1_error[~valid] = np.nan  # Mark invalid regions
+        errors.append(l1_error)
     if 'l2' in error_types:
-        errors.append(np.mean((I_L - I_R_warped)**2, axis=-1))  # H x W scalar map
+        l2_error = np.mean((I_L - I_R_warped)**2, axis=-1)
+        l2_error[~valid] = np.nan  # Mark invalid regions
+        errors.append(l2_error)
     if 'ssim' in error_types:        
-        #ssim_err[~valid] = 5 # does not make a difference.
-        errors.append(photometric_error_ssim(I_L, I_R_warped))  # H x W scalar map
+        ssim_error = photometric_error_ssim(I_L, I_R_warped)
+        ssim_error[~valid] = np.nan  # Mark invalid regions
+        errors.append(ssim_error)
 
     total_error = np.sum(errors, axis=0)
     return total_error
@@ -148,17 +189,18 @@ def photometric_error_ssim(I_L, I_R_warped):
 
 if __name__ == "__main__":
     # Load parameters
-    rootdir = "I:\\My Drive\\Scene-6\\stereocal_results_f28mm_a22mm"
-    params_path = os.path.join(rootdir, 'stereocal_params.npz')
-    depth_map_path = os.path.join(rootdir, "raw_depth_h5", "raw_depth_lefts.h5")
-    pattern_info_path = os.path.join(rootdir, 'pattern_info.json')
-    rectified_left_path = os.path.join(rootdir, "rectified_h5", "rectified_lefts.h5")
-    rectified_right_path = rectified_left_path.replace("left", "right")
+    rootdir = "/content/drive/MyDrive/Scene-5/f-28.0mm/a-1.27mm/"
+    params_path = os.path.join(rootdir, 'stereocal_results_f28.0mm_a1.27mm','stereocal_params.npz')
+    depth_map_path = os.path.join(rootdir, 'rectified_depths_left' ,'depth_anything_v2_all_depths_packed.h5')
+    pattern_info_path = os.path.join(rootdir, 'stereocal_results_f28.0mm_a1.27mm' 'pattern_info.json')
+    rectified_left_path = os.path.join(rootdir, 'stereocal_results_f28.0mm_a1.27mm', "rectified", "rectified_lefts.h5")
+    rectified_right_path = rectified_left_path.replace("lefts", "rights")
 
     image_index = 14
     params = load_camera_params(params_path)
-    Kleft, Kright = params['Kleft'], params['Kright']
-    R, T = params['R'], params['T']
+    print(params)
+    K_inv = params['K_inv']
+    T = params['T']
     P1, P2 = params['P1'], params['P2']
     
     depth_map = load_h5_images(depth_map_path)[image_index]
@@ -170,7 +212,7 @@ if __name__ == "__main__":
             f"rectified_right: {rectified_right.shape}, " + \
             f"depth_map: {depth_map.shape}")
     
-    # Comvert left image regular pixel meshgrid to left camera 3D points,
+    # Convert left image regular pixel meshgrid to left camera 3D points,
     # scaled to match depth.
     X_c_left = px_to_camera(depth_map, K_inv)
     
@@ -179,10 +221,14 @@ if __name__ == "__main__":
 
     # Compute photometric errors between I_L_{(u,v):regular pixel meshgrid}
     # and I_R_{(u',v'):coordinates of right image obtained by projecting left image (u,v)}
-    err1 = photometric_error_l1(rectified_left, rectified_right, x_right_2d)
+    err1 = photometric_errors(rectified_left, rectified_right, x_right_2d, ['l1'])
     err2 = photometric_error_ssim(rectified_left, rectified_right)
 
     err_left = err1 + err2    
 
-    mean_error = np.nanmean(err_left)
-    print(f"Mean photometric error: {mean_error:.2f} over all pixels.")
+    # Calculate mean error only over valid (non-NaN) pixels
+    valid_pixels = ~np.isnan(err_left)
+    mean_error = np.nanmean(err_left[valid_pixels]) if np.any(valid_pixels) else np.nan
+    
+    print(f"Mean photometric error: {mean_error:.2f} over {np.sum(valid_pixels)} valid pixels.")
+    print(f"Total pixels: {err_left.size}, Valid pixels: {np.sum(valid_pixels)} ({100*np.sum(valid_pixels)/err_left.size:.1f}%)")
